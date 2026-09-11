@@ -121,6 +121,7 @@
     <div class="kicker">EAR TRAINER · LOCAL</div>
     <div class="header-top">
       <h1>Ear Trainer for Audio Engineers</h1>
+
       <div class="social-block">
         <span class="social-text">Say thanks — follow on social media</span>
        <div class="social-icons">
@@ -162,6 +163,9 @@
         </div>
       </div>
     </div>
+
+
+
     <p>Works offline, no server needed — just open this file in your browser.</p>
   </header>
 
@@ -186,13 +190,17 @@
         <input type="number" id="startOffset" min="0" step="0.5" value="0" style="width:80px;">
       </label>
     </div>
+    <div class="source-row" id="playbackModeRow" style="display:none;">
+      <div class="mode-toggle" id="playbackMode" style="margin-top:10;">
+        <button class="mode-btn active" data-mode="restart">Restart from selected time each time</button>
+        <button class="mode-btn" data-mode="seamless">Seamless (no restart, live A/B)</button>
+      </div>
+    </div>
     <div class="vol-row">
       <label>Volume</label>
       <input type="range" id="volume" min="0" max="1" step="0.01" value="0.6">
     </div>
   </div>
-
-
 
   <nav class="tabs">
     <button class="tab-btn active" data-tab="boost">1 · Boost</button>
@@ -429,6 +437,7 @@
   let folderFiles = [];
   const decodedCache = new Map();
   let currentTrackDuration = 0;
+  let playbackMode = "restart"; // "restart" (always restart from the chosen start time) | "seamless" (keep playing, just swap the chain)
 
   /* overlays drawn on the shared spectrum canvas */
   let overlay = null;       // correct answer, shown after a reveal: {type,freq,gain,Q,labelY}
@@ -467,12 +476,41 @@
     if(masterGain) masterGain.gain.value = parseFloat(e.target.value);
   });
 
+  let activeFirstNode = null;   // node the currently playing source connects into: masterGain (dry) or the first chain node (processed)
+  let activeChainNodes = [];    // processing nodes (filter/compressor/panner etc.) currently interposed, for cleanup
+
+  function attachChain(src, buildChain, c){
+    let tail = src;
+    const nodes = [];
+    if(buildChain){
+      const chain = buildChain(c);
+      const chainNodes = Array.isArray(chain) ? chain : [chain];
+      let prev = src;
+      for(const node of chainNodes){ prev.connect(node); prev = node; nodes.push(node); }
+      tail = prev;
+    }
+    tail.connect(masterGain);
+    activeFirstNode = nodes.length ? nodes[0] : masterGain;
+    activeChainNodes = nodes;
+  }
+
+  function detachChain(src){
+    if(activeFirstNode){
+      try{ src.disconnect(activeFirstNode); }catch(e){}
+    }
+    activeChainNodes.forEach(n=>{ try{ n.disconnect(); }catch(e){} });
+    activeFirstNode = null;
+    activeChainNodes = [];
+  }
+
   function stopActive(){
     if(activeSource){
       try{ activeSource.stop(); }catch(e){}
       activeSource.disconnect();
       activeSource = null;
     }
+    activeFirstNode = null;
+    activeChainNodes = [];
     document.querySelectorAll("button.playing").forEach(b=>b.classList.remove("playing"));
   }
 
@@ -545,6 +583,9 @@
   async function updateTrackDurationUI(){
     const isFile = $("sourceType").value === "file";
     const selVal = $("trackSelect").value;
+
+    $("playbackModeRow").style.display = (isFile && folderFiles.length) ? "flex" : "none";
+
     if(!isFile || !folderFiles.length || selVal === "random"){
       $("trackDurationRow").style.display = "none";
       currentTrackDuration = 0;
@@ -636,8 +677,19 @@
   }
 
   async function play(buttonId, buildChain){
-    stopActive();
     const c = ensureCtx();
+    const isFileSource = $("sourceType").value === "file";
+    const seamless = playbackMode === "seamless" && isFileSource && activeSource;
+
+    if(seamless){
+      detachChain(activeSource);
+      attachChain(activeSource, buildChain, c);
+      document.querySelectorAll("button.playing").forEach(b=>b.classList.remove("playing"));
+      $(buttonId).classList.add("playing");
+      return;
+    }
+
+    stopActive();
     let info;
     try{ info = await loadCurrentSource(); }
     catch(err){ alert(err.message); return; }
@@ -654,20 +706,19 @@
     // "neutral" until a round is answered, regardless of which button is pressed.
     src.connect(analyserDry);
 
-    let tail = src;
-    if(buildChain){
-      const chain = buildChain(c);
-      const nodes = Array.isArray(chain) ? chain : [chain];
-      let prev = src;
-      for(const node of nodes){ prev.connect(node); prev = node; }
-      tail = prev;
-    }
-    tail.connect(masterGain);
+    attachChain(src, buildChain, c);
     src.start(0, info.offset || 0);
 
     activeSource = src;
     $(buttonId).classList.add("playing");
   }
+
+  document.querySelectorAll("#playbackMode .mode-btn").forEach(b=>{
+    b.addEventListener("click", ()=>{
+      playbackMode = b.dataset.mode;
+      document.querySelectorAll("#playbackMode .mode-btn").forEach(x=>x.classList.toggle("active", x===b));
+    });
+  });
 
   $("boost-stop").addEventListener("click", stopActive);
   $("cut-stop").addEventListener("click", stopActive);
@@ -1002,6 +1053,7 @@
           if(b === btnEl && !isCorrect) b.classList.add("wrong");
         });
         $(prefix+"-readout").textContent = `Answer: ${formatFreq(freq)}, ${fmtGain(gain)} (peaking, Q≈1.2)`;
+        guessOverlay = { type:"peaking", freq:guessFreq, gain: gain, Q:1.2, labelY: VH-8 };
       } else {
         const errPct = freqErrorPct(guessFreq, freq);
         $(prefix+"-readout").textContent =
@@ -1135,6 +1187,7 @@
     });
 
     $("shelf-readout").textContent = `Answer: ${shelfLabel(correct)}`;
+    guessOverlay = { type: chosen.type, freq: chosen.freq, gain: chosen.gain, Q: 0.71, labelY: VH-8 };
     overlay = { type: correct.type, freq: correct.freq, gain: correct.gain, Q: 0.71 };
   }
 
@@ -1343,6 +1396,7 @@
         if(b === btnEl && !isCorrect) b.classList.add("wrong");
       });
       $("pan-readout").textContent = `Answer: ${formatPan(pan)}`;
+      panGuessOverlay = guessPct;
     } else {
       const errPP = Math.abs(guessPct - pan);
       $("pan-readout").textContent =
